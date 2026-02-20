@@ -71,6 +71,10 @@ ALL_FIELDS = [
     "Scaled UV-Power",
 ]
 
+BYTESIZE_OPTIONS = ("5", "6", "7", "8")
+PARITY_OPTIONS = ("None", "Even", "Odd", "Mark", "Space")
+STOPBITS_OPTIONS = ("1", "1.5", "2")
+
 
 class SCPITerminalApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -81,6 +85,19 @@ class SCPITerminalApp:
         self.ser = None
         self.reader_thread = None
         self.stop_reader = threading.Event()
+        self.pause_reader = threading.Event()
+        self.serial_lock = threading.Lock()
+
+        self.monitor_thread = None
+        self.monitor_stop = threading.Event()
+        self.monitor_rows: list[dict[str, float | str]] = []
+        self.monitor_csv_file = None
+        self.monitor_set_shg = 0.0
+        self.monitor_set_thg = 0.0
+        self.monitor_dev_shg: list[float] = []
+        self.monitor_dev_thg: list[float] = []
+        self.monitor_timestamps: list[float] = []
+        self.monitor_active = False
 
         self.response_lines: list[str] = []
         self.current_params: dict[str, str] = {}
@@ -108,16 +125,38 @@ class SCPITerminalApp:
         self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=["9600", "19200", "38400", "57600", "115200"], state="readonly")
         self.baud_combo.grid(row=0, column=3, padx=5)
 
-        ttk.Label(top, text="Timeout (s):").grid(row=0, column=4, sticky=tk.W)
-        self.timeout_var = tk.StringVar(value="1")
-        ttk.Entry(top, textvariable=self.timeout_var, width=8).grid(row=0, column=5, padx=5)
+        ttk.Label(top, text="Datenbits:").grid(row=0, column=4, sticky=tk.W)
+        self.bytesize_var = tk.StringVar(value="8")
+        self.bytesize_combo = ttk.Combobox(top, textvariable=self.bytesize_var, width=6, values=BYTESIZE_OPTIONS, state="readonly")
+        self.bytesize_combo.grid(row=0, column=5, padx=5)
 
-        ttk.Button(top, text="Ports neu laden", command=self._refresh_ports).grid(row=0, column=6, padx=8)
+        ttk.Label(top, text="Parität:").grid(row=0, column=6, sticky=tk.W)
+        self.parity_var = tk.StringVar(value="None")
+        self.parity_combo = ttk.Combobox(top, textvariable=self.parity_var, width=8, values=PARITY_OPTIONS, state="readonly")
+        self.parity_combo.grid(row=0, column=7, padx=5)
+
+        ttk.Label(top, text="Stopbits:").grid(row=0, column=8, sticky=tk.W)
+        self.stopbits_var = tk.StringVar(value="1")
+        self.stopbits_combo = ttk.Combobox(top, textvariable=self.stopbits_var, width=6, values=STOPBITS_OPTIONS, state="readonly")
+        self.stopbits_combo.grid(row=0, column=9, padx=5)
+
+        ttk.Label(top, text="Timeout (s):").grid(row=0, column=10, sticky=tk.W)
+        self.timeout_var = tk.StringVar(value="1")
+        ttk.Entry(top, textvariable=self.timeout_var, width=8).grid(row=0, column=11, padx=5)
+
+        ttk.Button(top, text="Ports neu laden", command=self._refresh_ports).grid(row=0, column=12, padx=8)
         self.connect_btn = ttk.Button(top, text="Verbinden", command=self._toggle_connection)
-        self.connect_btn.grid(row=0, column=7, padx=8)
+        self.connect_btn.grid(row=0, column=13, padx=8)
 
         self.status_var = tk.StringVar(value="Nicht verbunden")
-        ttk.Label(top, textvariable=self.status_var, foreground="#444").grid(row=0, column=8, sticky=tk.W, padx=4)
+        ttk.Label(top, textvariable=self.status_var, foreground="#444").grid(row=0, column=14, sticky=tk.W, padx=4)
+
+        self.monitor_btn_top = ttk.Button(
+            top,
+            text="monitor Temp Stage SHG/THG",
+            command=self.toggle_temp_monitor,
+        )
+        self.monitor_btn_top.grid(row=0, column=15, padx=6)
 
         catalog = ttk.LabelFrame(self.root, text="SCPI Katalog", padding=10)
         catalog.pack(fill=tk.X, padx=10, pady=(0, 8))
@@ -165,6 +204,13 @@ class SCPITerminalApp:
         bottom = ttk.Frame(self.root, padding=10)
         bottom.pack(fill=tk.X)
 
+        self.monitor_btn_bottom = ttk.Button(
+            bottom,
+            text="monitor Temp Stage SHG/THG",
+            command=self.toggle_temp_monitor,
+        )
+        self.monitor_btn_bottom.pack(side=tk.LEFT, padx=(0, 10))
+
         ttk.Button(bottom, text="Antworten als TXT speichern", command=self.save_txt).pack(side=tk.LEFT)
         ttk.Button(bottom, text="Antworten als CSV speichern", command=self.save_csv).pack(side=tk.LEFT, padx=5)
         ttk.Button(bottom, text="Log löschen", command=self.clear_output).pack(side=tk.LEFT, padx=(0, 20))
@@ -172,6 +218,28 @@ class SCPITerminalApp:
         ttk.Button(bottom, text="Aktuelle Parameter aus letztem Kommando", command=self.extract_current_params).pack(side=tk.LEFT)
         ttk.Button(bottom, text="Referenzdatei laden", command=self.load_baseline_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(bottom, text="Parameter vergleichen", command=self.compare_params).pack(side=tk.LEFT)
+
+        monitor_frame = ttk.LabelFrame(self.root, text="Temp Monitor Δ zu Set-Wert", padding=10)
+        monitor_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        monitor_header = ttk.Frame(monitor_frame)
+        monitor_header.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(
+            monitor_header,
+            text="SHG/THG Live-Monitor (100 ms Polling)",
+        ).pack(side=tk.LEFT)
+
+        self.monitor_btn = ttk.Button(
+            monitor_header,
+            text="monitor Temp Stage SHG/THG",
+            command=self.toggle_temp_monitor,
+        )
+        self.monitor_btn.pack(side=tk.RIGHT)
+
+        self.monitor_canvas = tk.Canvas(monitor_frame, height=170, background="#101010", highlightthickness=0)
+        self.monitor_canvas.pack(fill=tk.X, expand=True)
+        self.monitor_info_var = tk.StringVar(value="Monitor aus")
+        ttk.Label(monitor_frame, textvariable=self.monitor_info_var).pack(anchor=tk.W, pady=(6, 0))
 
         cmp_frame = ttk.LabelFrame(self.root, text="Vergleich", padding=10)
         cmp_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -216,7 +284,17 @@ class SCPITerminalApp:
         try:
             baud = int(self.baud_var.get())
             timeout = float(self.timeout_var.get())
-            self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
+            bytesize = self._parse_bytesize(self.bytesize_var.get())
+            parity = self._parse_parity(self.parity_var.get())
+            stopbits = self._parse_stopbits(self.stopbits_var.get())
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                timeout=timeout,
+                bytesize=bytesize,
+                parity=parity,
+                stopbits=stopbits,
+            )
         except Exception as exc:
             messagebox.showerror("Verbindungsfehler", str(exc))
             return
@@ -225,10 +303,255 @@ class SCPITerminalApp:
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
         self.connect_btn.configure(text="Trennen")
-        self.status_var.set(f"Verbunden: {port} @ {baud}")
+        self.status_var.set(f"Verbunden: {port} @ {baud}, {self._format_framing()}")
         self._append_output("[INFO] Verbindung hergestellt")
 
+    def _format_framing(self) -> str:
+        parity = self.parity_var.get().strip()
+        parity_letter = "N" if parity == "None" else parity[:1].upper()
+        return f"{self.bytesize_var.get().strip()}{parity_letter}{self.stopbits_var.get().strip()}"
+
+    @staticmethod
+    def _parse_bytesize(value: str) -> int:
+        mapping = {
+            "5": serial.FIVEBITS,
+            "6": serial.SIXBITS,
+            "7": serial.SEVENBITS,
+            "8": serial.EIGHTBITS,
+        }
+        return mapping.get(value.strip(), serial.EIGHTBITS)
+
+    @staticmethod
+    def _parse_parity(value: str) -> str:
+        mapping = {
+            "none": serial.PARITY_NONE,
+            "even": serial.PARITY_EVEN,
+            "odd": serial.PARITY_ODD,
+            "mark": serial.PARITY_MARK,
+            "space": serial.PARITY_SPACE,
+        }
+        return mapping.get(value.strip().lower(), serial.PARITY_NONE)
+
+    @staticmethod
+    def _parse_stopbits(value: str) -> float:
+        mapping = {
+            "1": serial.STOPBITS_ONE,
+            "1.5": serial.STOPBITS_ONE_POINT_FIVE,
+            "2": serial.STOPBITS_TWO,
+        }
+        return mapping.get(value.strip(), serial.STOPBITS_ONE)
+
+    def _query_serial(self, cmd: str) -> str:
+        if not self.ser or not self.ser.is_open:
+            raise RuntimeError("Nicht verbunden")
+
+        with self.serial_lock:
+            self.pause_reader.set()
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.write((cmd + "\n").encode())
+                self._safe_append_output(f"TX> {cmd}")
+                raw = self.ser.readline()
+                text = raw.decode(errors="replace").strip() if raw else ""
+                self._safe_append_output(f"RX> {text if text else '<timeout>'}")
+                return text
+            finally:
+                self.pause_reader.clear()
+
+    def _safe_append_output(self, line: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self._append_output(line)
+        else:
+            self.root.after(0, self._append_output, line)
+
+    @staticmethod
+    def _parse_float_response(value: str) -> float:
+        if not value:
+            raise ValueError("Leere Antwort")
+        match = re.search(r"[-+]?\d+(?:[\.,]\d+)?", value)
+        if not match:
+            raise ValueError(f"Kein Zahlenwert in Antwort: {value}")
+        return float(match.group(0).replace(",", "."))
+
+    def toggle_temp_monitor(self) -> None:
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.stop_temp_monitor()
+        else:
+            self.start_temp_monitor()
+
+    def start_temp_monitor(self) -> None:
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Nicht verbunden", "Bitte zuerst verbinden")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Monitor CSV speichern",
+            defaultextension=".csv",
+            initialfile=f"temp_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not path:
+            return
+
+        try:
+            set_shg = self._parse_float_response(self._query_serial("SOURce:TEMPerature:LEVel:SET? TEMP_STAGE_SHG"))
+            set_thg = self._parse_float_response(self._query_serial("SOURce:TEMPerature:LEVel:SET? TEMP_STAGE_THG"))
+        except Exception as exc:
+            messagebox.showerror("Monitor Fehler", f"Set-Werte konnten nicht gelesen werden:\n{exc}")
+            return
+
+        self.monitor_csv_file = path
+        self.monitor_set_shg = set_shg
+        self.monitor_set_thg = set_thg
+        self.monitor_rows.clear()
+        self.monitor_dev_shg.clear()
+        self.monitor_dev_thg.clear()
+        self.monitor_timestamps.clear()
+        self.monitor_stop.clear()
+        self.monitor_active = True
+
+        self._set_monitor_button_text("Stop monitor Temp Stage SHG/THG")
+        self.monitor_info_var.set(f"Monitor läuft | Set SHG={set_shg:.3f} | Set THG={set_thg:.3f}")
+        self._append_output(f"[INFO] Temp Monitor gestartet -> {path}")
+
+        self.monitor_thread = threading.Thread(target=self._temp_monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+    def stop_temp_monitor(self) -> None:
+        if not self.monitor_active:
+            return
+
+        self.monitor_stop.set()
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=1.5)
+
+        if self.monitor_rows and self.monitor_csv_file:
+            self._write_monitor_csv(self.monitor_csv_file)
+            self._append_output(f"[INFO] Temp Monitor CSV gespeichert: {self.monitor_csv_file}")
+
+        self._set_monitor_button_text("monitor Temp Stage SHG/THG")
+        self.monitor_info_var.set("Monitor aus")
+        self.monitor_active = False
+
+    def _set_monitor_button_text(self, text: str) -> None:
+        self.monitor_btn.configure(text=text)
+        self.monitor_btn_top.configure(text=text)
+        self.monitor_btn_bottom.configure(text=text)
+
+    def _temp_monitor_loop(self) -> None:
+        start_ts = time.time()
+        interval_s = 0.1
+
+        while not self.monitor_stop.is_set() and self.ser and self.ser.is_open:
+            ts = time.time()
+            elapsed = ts - start_ts
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+            try:
+                act_shg = self._parse_float_response(self._query_serial("SOURce:TEMPerature:ACTual? TEMP_STAGE_SHG"))
+                act_thg = self._parse_float_response(self._query_serial("SOURce:TEMPerature:ACTual? TEMP_STAGE_THG"))
+            except Exception as exc:
+                self.root.after(0, self._append_output, f"[ERROR] Temp Monitor: {exc}")
+                break
+
+            dev_shg = act_shg - self.monitor_set_shg
+            dev_thg = act_thg - self.monitor_set_thg
+
+            self.monitor_rows.append(
+                {
+                    "timestamp": stamp,
+                    "elapsed_s": elapsed,
+                    "set_shg": self.monitor_set_shg,
+                    "actual_shg": act_shg,
+                    "deviation_shg": dev_shg,
+                    "set_thg": self.monitor_set_thg,
+                    "actual_thg": act_thg,
+                    "deviation_thg": dev_thg,
+                }
+            )
+            self.monitor_timestamps.append(elapsed)
+            self.monitor_dev_shg.append(dev_shg)
+            self.monitor_dev_thg.append(dev_thg)
+
+            self.root.after(0, self._update_monitor_plot)
+
+            next_tick = ts + interval_s
+            remaining = next_tick - time.time()
+            if remaining > 0:
+                time.sleep(remaining)
+
+        self.root.after(0, self.stop_temp_monitor)
+
+    def _write_monitor_csv(self, path: str) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "timestamp",
+                    "elapsed_s",
+                    "set_shg",
+                    "actual_shg",
+                    "deviation_shg",
+                    "set_thg",
+                    "actual_thg",
+                    "deviation_thg",
+                ],
+                delimiter=";",
+            )
+            writer.writeheader()
+            writer.writerows(self.monitor_rows)
+
+    def _update_monitor_plot(self) -> None:
+        canvas = self.monitor_canvas
+        canvas.delete("all")
+
+        width = max(canvas.winfo_width(), 200)
+        height = max(canvas.winfo_height(), 120)
+        pad = 24
+        left, top, right, bottom = pad, pad, width - pad, height - pad
+
+        canvas.create_rectangle(left, top, right, bottom, outline="#666")
+        mid_y = (top + bottom) / 2
+        canvas.create_line(left, mid_y, right, mid_y, fill="#555", dash=(4, 4))
+        canvas.create_text(left + 4, mid_y - 8, text="Δ=0", fill="#bbb", anchor=tk.W)
+
+        if len(self.monitor_timestamps) < 2:
+            canvas.create_text(left + 4, top + 4, text="warte auf Daten...", fill="#ccc", anchor=tk.NW)
+            return
+
+        max_abs = max(
+            max(abs(v) for v in self.monitor_dev_shg),
+            max(abs(v) for v in self.monitor_dev_thg),
+            0.01,
+        )
+        x_min = self.monitor_timestamps[0]
+        x_max = self.monitor_timestamps[-1]
+        x_range = max(x_max - x_min, 0.1)
+
+        def to_xy(xv: float, yv: float) -> tuple[float, float]:
+            x = left + ((xv - x_min) / x_range) * (right - left)
+            y = mid_y - (yv / max_abs) * ((bottom - top) / 2)
+            return x, y
+
+        points_shg = [coord for x, y in (to_xy(xv, yv) for xv, yv in zip(self.monitor_timestamps, self.monitor_dev_shg)) for coord in (x, y)]
+        points_thg = [coord for x, y in (to_xy(xv, yv) for xv, yv in zip(self.monitor_timestamps, self.monitor_dev_thg)) for coord in (x, y)]
+
+        canvas.create_line(*points_shg, fill="#2ecc71", width=2, smooth=True)
+        canvas.create_line(*points_thg, fill="#ff8c42", width=2, smooth=True)
+        canvas.create_text(right - 120, top + 10, text="SHG Δ", fill="#2ecc71", anchor=tk.W)
+        canvas.create_text(right - 120, top + 24, text="THG Δ", fill="#ff8c42", anchor=tk.W)
+        canvas.create_text(
+            left + 4,
+            top + 4,
+            text=f"±{max_abs:.3f}",
+            fill="#bbb",
+            anchor=tk.NW,
+        )
+
     def _disconnect(self) -> None:
+        if self.monitor_active:
+            self.stop_temp_monitor()
+
         self.stop_reader.set()
         if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=1)
@@ -245,8 +568,12 @@ class SCPITerminalApp:
 
     def _reader_loop(self) -> None:
         while not self.stop_reader.is_set() and self.ser and self.ser.is_open:
+            if self.pause_reader.is_set():
+                time.sleep(0.01)
+                continue
             try:
-                raw = self.ser.readline()
+                with self.serial_lock:
+                    raw = self.ser.readline()
                 if raw:
                     text = raw.decode(errors="replace").strip()
                     if text:
