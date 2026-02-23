@@ -1,0 +1,292 @@
+From d00e000de2ea1f5776b04afb81ce9c4e0b2c1b5b Mon Sep 17 00:00:00 2001
+From: hakerth-ldp <hubertus.hakert@coherent.com>
+Date: Fri, 20 Feb 2026 12:33:09 +0100
+Subject: [PATCH] Log Git runtime context to detect wrong launch directory
+
+---
+ README.md            |  39 +++++++++++++
+ scpi_terminal_gui.py | 127 ++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 159 insertions(+), 7 deletions(-)
+
+diff --git a/README.md b/README.md
+index e2eebd0..c1222c5 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,45 @@ python scpi_terminal_gui.py
+ 5. `Aktuelle Parameter aus letztem Kommando`.
+ 6. Referenzdatei laden, dann vergleichen.
+ 
++## Troubleshooting: UPort/COM-Port unter Windows
++
++Wenn in der App nur `COM3` auswählbar ist, im Gerätemanager aber zusätzlich ein Gerät wie `UPort 1110` unter **Andere Geräte** auftaucht, fehlt in der Regel der passende USB-Seriell-Treiber.
++
++- `UPort 1110` unter **Andere Geräte** = Windows erkennt den Adapter, aber hat **keinen funktionierenden COM-Treiber** zugeordnet.
++- Erst wenn der Treiber korrekt installiert ist, erscheint der Adapter unter **Anschlüsse (COM & LPT)** mit einem eigenen COM-Port (z. B. `COM5`).
++- Solange der Adapter dort nicht auftaucht, kann die GUI ihn nicht als seriellen Port anbieten.
++
++Kurz: Ja, du brauchst sehr wahrscheinlich den originalen Treiber für deinen Moxo/MOXA UPort RS232-auf-USB-Adapter.
++
++### Wenn `*IDN?` nur Zeichenmüll liefert
++
++Wenn eine Verbindung aufgebaut ist, aber Antworten wie `*IDN?` als unlesbare Zeichen erscheinen, sind fast immer die seriellen Parameter falsch (vor allem Baudrate).
++
++Typische Ursachen:
++- Falsche **Baudrate** (häufigster Grund).
++- Falsche **Parität/Stopbits/Datenbits** (z. B. Gerät erwartet `8N1`).
++- Falsches **Zeilenende** beim Senden (`LF`, `CR` oder `CRLF`).
++
++Die GUI bietet dafür nun zusätzliche Einstellungen: Datenbits, Parität, Stopbits, Encoding und Zeilenende.
++Diese findest du in der separaten Box **"Serielle Einstellungen"** direkt unter der COM-Verbindung.
++Beim Start zeigt die App zusätzlich die Build-Anzeige (z. B. `Build: v2.1`) sowie den geladenen Script-Pfad im Log, damit du sofort siehst, dass wirklich die aktuelle Datei läuft.
++Zusätzlich loggt die App jetzt `CWD`, `Git Root`, `Git Branch` und `Git Commit`, damit man sofort sieht, aus welchem Repo/Branch die laufende Instanz wirklich kommt.
++Wenn dort kein Git-Repo gefunden wird, startest du sehr wahrscheinlich eine Datei außerhalb deines Projektordners.
++Teste am besten zuerst diese Kombination:
++- `115200`, `8`, `None`, `1` (8N1)
++- Zeilenende `LF`, alternativ `CRLF`
++- Encoding `ascii`
++
++Wenn weiterhin Müll kommt, stimmt meist weiterhin Baudrate oder Parität nicht mit den Laser-Controller-Defaults überein.
++
++Zusatz bei **Error 600** (SCPI Timeout / end of command indicator):
++- Stelle zuerst **Zeilenende = `CR`** ein (bei vielen Lasern korrekt), alternativ `CRLF`.
++- Prüfe im Log den Eintrag `TX HEX`:
++  - `... 0d` = CR
++  - `... 0a` = LF
++  - `... 0d 0a` = CRLF
++- Nutze den Button **IDN Terminator-Test**, um `*IDN?` automatisch mit CR/LF/CRLF/None zu senden.
++
+ ## Hinweis XALL
+ 
+ Für `SERVice:XALL? TEMPeratures|STEPper|OTHers` und `ALL?` wird automatisch die feste Reihenfolge verwendet.
+diff --git a/scpi_terminal_gui.py b/scpi_terminal_gui.py
+index 3e7d8d2..2ae9878 100644
+--- a/scpi_terminal_gui.py
++++ b/scpi_terminal_gui.py
+@@ -1,6 +1,7 @@
+ import csv
+ import re
+ import threading
++import subprocess
+ import time
+ from datetime import datetime
+ from pathlib import Path
+@@ -54,6 +55,8 @@ XALL_GROUP_FIELDS = {
+     ],
+ }
+ 
++APP_VERSION = "v2.1"
++
+ ALL_FIELDS = [
+     "Status",
+     "Warnings",
+@@ -75,7 +78,7 @@ ALL_FIELDS = [
+ class SCPITerminalApp:
+     def __init__(self, root: tk.Tk) -> None:
+         self.root = root
+-        self.root.title("SCPI Serial Terminal")
++        self.root.title(f"SCPI Serial Terminal {APP_VERSION}")
+         self.root.geometry("1240x800")
+ 
+         self.ser = None
+@@ -93,6 +96,31 @@ class SCPITerminalApp:
+ 
+         self._build_ui()
+         self._refresh_ports()
++        self.root.after(100, self._announce_runtime_info)
++
++    def _announce_runtime_info(self) -> None:
++        script_path = Path(__file__).resolve()
++        self._append_output(f"[INFO] App-Version: {APP_VERSION}")
++        self._append_output(f"[INFO] Script: {script_path}")
++        self._append_output(f"[INFO] CWD: {Path.cwd()}")
++
++        git_root, git_branch, git_commit = self._read_git_context(script_path.parent)
++        if git_root:
++            self._append_output(f"[INFO] Git Root: {git_root}")
++            self._append_output(f"[INFO] Git Branch: {git_branch}")
++            self._append_output(f"[INFO] Git Commit: {git_commit}")
++        else:
++            self._append_output("[WARN] Kein Git-Repository für das gestartete Script gefunden")
++
++    @staticmethod
++    def _read_git_context(start_dir: Path) -> tuple[str, str, str]:
++        try:
++            root = subprocess.check_output(["git", "-C", str(start_dir), "rev-parse", "--show-toplevel"], text=True).strip()
++            branch = subprocess.check_output(["git", "-C", str(start_dir), "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
++            commit = subprocess.check_output(["git", "-C", str(start_dir), "rev-parse", "--short", "HEAD"], text=True).strip()
++            return root, branch, commit
++        except Exception:
++            return "", "", ""
+ 
+     def _build_ui(self) -> None:
+         top = ttk.Frame(self.root, padding=10)
+@@ -105,7 +133,7 @@ class SCPITerminalApp:
+ 
+         ttk.Label(top, text="Baudrate:").grid(row=0, column=2, sticky=tk.W)
+         self.baud_var = tk.StringVar(value="9600")
+-        self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=["9600", "19200", "38400", "57600", "115200"], state="readonly")
++        self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200", "230400"], state="readonly")
+         self.baud_combo.grid(row=0, column=3, padx=5)
+ 
+         ttk.Label(top, text="Timeout (s):").grid(row=0, column=4, sticky=tk.W)
+@@ -119,6 +147,35 @@ class SCPITerminalApp:
+         self.status_var = tk.StringVar(value="Nicht verbunden")
+         ttk.Label(top, textvariable=self.status_var, foreground="#444").grid(row=0, column=8, sticky=tk.W, padx=4)
+ 
++        self.version_var = tk.StringVar(value=f"Build: {APP_VERSION}")
++        ttk.Label(top, textvariable=self.version_var, foreground="#666").grid(row=0, column=9, sticky=tk.E, padx=4)
++
++        serial_opts = ttk.LabelFrame(self.root, text="Serielle Einstellungen", padding=10)
++        serial_opts.pack(fill=tk.X, padx=10, pady=(0, 8))
++
++        ttk.Label(serial_opts, text="Datenbits:").grid(row=0, column=0, sticky=tk.W)
++        self.bytesize_var = tk.StringVar(value="8")
++        ttk.Combobox(serial_opts, textvariable=self.bytesize_var, width=7, values=["5", "6", "7", "8"], state="readonly").grid(row=0, column=1, padx=(5, 12), sticky=tk.W)
++
++        ttk.Label(serial_opts, text="Parität:").grid(row=0, column=2, sticky=tk.W)
++        self.parity_var = tk.StringVar(value="None")
++        ttk.Combobox(serial_opts, textvariable=self.parity_var, width=8, values=["None", "Even", "Odd", "Mark", "Space"], state="readonly").grid(row=0, column=3, padx=(5, 12), sticky=tk.W)
++
++        ttk.Label(serial_opts, text="Stopbits:").grid(row=0, column=4, sticky=tk.W)
++        self.stopbits_var = tk.StringVar(value="1")
++        ttk.Combobox(serial_opts, textvariable=self.stopbits_var, width=6, values=["1", "1.5", "2"], state="readonly").grid(row=0, column=5, padx=(5, 12), sticky=tk.W)
++
++        ttk.Label(serial_opts, text="Encoding:").grid(row=0, column=6, sticky=tk.W)
++        self.encoding_var = tk.StringVar(value="ascii")
++        ttk.Combobox(serial_opts, textvariable=self.encoding_var, width=8, values=["ascii", "utf-8", "latin-1"], state="readonly").grid(row=0, column=7, padx=(5, 12), sticky=tk.W)
++
++        ttk.Label(serial_opts, text="Zeilenende:").grid(row=0, column=8, sticky=tk.W)
++        self.newline_var = tk.StringVar(value="CR")
++        ttk.Combobox(serial_opts, textvariable=self.newline_var, width=7, values=["CR", "LF", "CRLF", "None"], state="readonly").grid(row=0, column=9, padx=(5, 12), sticky=tk.W)
++
++        ttk.Button(serial_opts, text="Preset 115200 8N1 CR", command=lambda: self._apply_serial_preset("115200", "8", "None", "1", "ascii", "CR")).grid(row=0, column=10, sticky=tk.W)
++        ttk.Button(serial_opts, text="Preset 115200 8N1 CRLF", command=lambda: self._apply_serial_preset("115200", "8", "None", "1", "ascii", "CRLF")).grid(row=0, column=11, sticky=tk.W, padx=(8, 0))
++
+         catalog = ttk.LabelFrame(self.root, text="SCPI Katalog", padding=10)
+         catalog.pack(fill=tk.X, padx=10, pady=(0, 8))
+ 
+@@ -153,6 +210,7 @@ class SCPITerminalApp:
+ 
+         ttk.Button(cmd_row, text="Senden", command=self.send_command).pack(side=tk.LEFT)
+         ttk.Button(cmd_row, text="*IDN?", command=lambda: self._preset_send("*IDN?")).pack(side=tk.LEFT, padx=5)
++        ttk.Button(cmd_row, text="IDN Terminator-Test", command=self._idn_terminator_test).pack(side=tk.LEFT, padx=5)
+         ttk.Button(cmd_row, text="ALL?", command=lambda: self._preset_send("ALL?")).pack(side=tk.LEFT, padx=5)
+         ttk.Button(cmd_row, text="SERVice:XALL? TEMPeratures", command=lambda: self._preset_send("SERVice:XALL? TEMPeratures")).pack(side=tk.LEFT)
+ 
+@@ -186,6 +244,15 @@ class SCPITerminalApp:
+         self.compare_tree.tag_configure("diff", background="#ffe8e8")
+         self.compare_tree.tag_configure("missing", background="#fff8d9")
+ 
++    def _apply_serial_preset(self, baud: str, bits: str, parity: str, stopbits: str, encoding: str, newline: str) -> None:
++        self.baud_var.set(baud)
++        self.bytesize_var.set(bits)
++        self.parity_var.set(parity)
++        self.stopbits_var.set(stopbits)
++        self.encoding_var.set(encoding)
++        self.newline_var.set(newline)
++        self._append_output(f"[INFO] Preset gesetzt: {baud}, {bits}{parity[0]}{stopbits}, {newline}, {encoding}")
++
+     def _refresh_ports(self) -> None:
+         if list_ports is None:
+             self.port_combo["values"] = []
+@@ -216,7 +283,23 @@ class SCPITerminalApp:
+         try:
+             baud = int(self.baud_var.get())
+             timeout = float(self.timeout_var.get())
+-            self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
++            bytesize_map = {"5": serial.FIVEBITS, "6": serial.SIXBITS, "7": serial.SEVENBITS, "8": serial.EIGHTBITS}
++            parity_map = {
++                "None": serial.PARITY_NONE,
++                "Even": serial.PARITY_EVEN,
++                "Odd": serial.PARITY_ODD,
++                "Mark": serial.PARITY_MARK,
++                "Space": serial.PARITY_SPACE,
++            }
++            stopbits_map = {"1": serial.STOPBITS_ONE, "1.5": serial.STOPBITS_ONE_POINT_FIVE, "2": serial.STOPBITS_TWO}
++            self.ser = serial.Serial(
++                port=port,
++                baudrate=baud,
++                timeout=timeout,
++                bytesize=bytesize_map.get(self.bytesize_var.get(), serial.EIGHTBITS),
++                parity=parity_map.get(self.parity_var.get(), serial.PARITY_NONE),
++                stopbits=stopbits_map.get(self.stopbits_var.get(), serial.STOPBITS_ONE),
++            )
+         except Exception as exc:
+             messagebox.showerror("Verbindungsfehler", str(exc))
+             return
+@@ -225,8 +308,9 @@ class SCPITerminalApp:
+         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+         self.reader_thread.start()
+         self.connect_btn.configure(text="Trennen")
+-        self.status_var.set(f"Verbunden: {port} @ {baud}")
+-        self._append_output("[INFO] Verbindung hergestellt")
++        framing = f"{self.bytesize_var.get()}{self.parity_var.get()[0]}{self.stopbits_var.get()}"
++        self.status_var.set(f"Verbunden: {port} @ {baud} ({framing})")
++        self._append_output(f"[INFO] Verbindung hergestellt ({port}, {baud}, {framing}, {self.newline_var.get()}, {self.encoding_var.get()})")
+ 
+     def _disconnect(self) -> None:
+         self.stop_reader.set()
+@@ -248,19 +332,44 @@ class SCPITerminalApp:
+             try:
+                 raw = self.ser.readline()
+                 if raw:
+-                    text = raw.decode(errors="replace").strip()
++                    text, hex_hint = self._decode_raw_bytes(raw)
+                     if text:
+                         self.root.after(0, self._append_output, f"RX> {text}")
++                    if hex_hint:
++                        self.root.after(0, self._append_output, f"[HINT] RX HEX: {hex_hint}")
+                 else:
+                     time.sleep(0.02)
+             except Exception as exc:
+                 self.root.after(0, self._append_output, f"[ERROR] Lesefehler: {exc}")
+                 break
+ 
++    def _decode_raw_bytes(self, raw: bytes) -> tuple[str, str]:
++        encoding = self.encoding_var.get().strip() or "ascii"
++        text = raw.decode(encoding, errors="replace").strip()
++        replacement_count = text.count("�")
++        bad_ratio = (replacement_count / max(len(text), 1)) if text else 0
++        if bad_ratio > 0.2:
++            return text, raw.hex(" ")
++        return text, ""
++
+     def _preset_send(self, cmd: str) -> None:
+         self.command_var.set(cmd)
+         self.send_command()
+ 
++    def _idn_terminator_test(self) -> None:
++        if not self.ser or not self.ser.is_open:
++            messagebox.showwarning("Nicht verbunden", "Bitte zuerst verbinden")
++            return
++
++        original_newline = self.newline_var.get()
++        for term in ["CR", "LF", "CRLF", "None"]:
++            self.newline_var.set(term)
++            self.command_var.set("*IDN?")
++            self.send_command()
++            time.sleep(0.15)
++        self.newline_var.set(original_newline)
++        self._append_output("[INFO] IDN Terminator-Test gesendet (CR/LF/CRLF/None)")
++
+     def send_command(self) -> None:
+         cmd = self.command_var.get().strip()
+         if not cmd:
+@@ -270,9 +379,13 @@ class SCPITerminalApp:
+             return
+ 
+         try:
+-            self.ser.write((cmd + "\n").encode())
++            newline_map = {"LF": "\n", "CR": "\r", "CRLF": "\r\n", "None": ""}
++            line_end = newline_map.get(self.newline_var.get(), "\r")
++            payload = (cmd + line_end).encode(self.encoding_var.get(), errors="replace")
++            self.ser.write(payload)
+             self.last_sent_command = cmd
+             self._append_output(f"TX> {cmd}")
++            self._append_output(f"[DEBUG] TX HEX: {payload.hex(' ')}")
+             self.command_var.set("")
+         except Exception as exc:
+             messagebox.showerror("Senden fehlgeschlagen", str(exc))
+-- 
+2.53.0.windows.1
+
